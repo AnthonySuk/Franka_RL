@@ -1,70 +1,68 @@
-from legged_gym.envs import PointFootRoughCfg, PointFootRoughCfgPPO
+from legged_gym.envs import TitaRoughCfg, TitaRoughCfgPPO
 
 
-class PointFootFlatCfg(PointFootRoughCfg):
-    class env(PointFootRoughCfg.env):
+class TitaFlatCfg(TitaRoughCfg):
+    class env(TitaRoughCfg.env):
         num_privileged_obs = 27 + 2 + 2
         num_propriceptive_obs = 27 + 2 + 2 # plus 2 dof vel(wheels) and 2 actions(wheels)
         num_actions = 8
 
-    class terrain(PointFootRoughCfg.terrain):
+    class terrain(TitaRoughCfg.terrain):
         mesh_type = "plane"
         measure_heights_critic = False
 
-    class commands(PointFootRoughCfg.commands):
+    class commands(TitaRoughCfg.commands):
         num_commands = 3
         heading_command = False
         resampling_time = 5.
 
-        class ranges(PointFootRoughCfg.commands.ranges):
+        class ranges(TitaRoughCfg.commands.ranges):
             lin_vel_x = [-1.0, 1.0]  # min max [m/s]
             heading = [-1.0, 1.0]
             lin_vel_y = [0, 0]
             ang_vel_yaw = [-3.14, 3.14]
     
-    class init_state(PointFootRoughCfg.init_state):
+    class init_state(TitaRoughCfg.init_state):
         # pos = [0.0, 0.0, 0.8] # origin
-        pos = [0.0, 0.0, 0.7 + 0.1664]  # x,y,z [m]
+        pos = [0.0, 0.0, 0.34]  # x,y,z [m]
         rot = [0.0, 0.0, 0.0, 1.0]  # x,y,z,w [quat]
         lin_vel = [0.0, 0.0, 0.0]  # x,y,z [m/s]
         ang_vel = [0.0, 0.0, 0.0]  # x,y,z [rad/s]
         default_joint_angles = {  # target angles when action = 0.0
-            "abad_L_Joint": 0.0,
-            "hip_L_Joint": 0.0,
-            "knee_L_Joint": 0.0,
-            "foot_L_Joint": 0.0,
-            "abad_R_Joint": 0.0,
-            "hip_R_Joint": 0.0,
-            "knee_R_Joint": 0.0,
-            "foot_R_Joint": 0.0,
-            "wheel_L_Joint": 0.0,
-            "wheel_R_Joint": 0.0,
+            "joint_left_leg_1": -0.0,
+            "joint_right_leg_1": 0.0,
+            "joint_left_leg_2": 0.8,
+            "joint_right_leg_2": 0.8,
+            "joint_left_leg_3": -1.5,
+            "joint_right_leg_3": -1.5,
+            "joint_left_leg_4": 0.0,
+            "joint_right_leg_4": 0.0,
         }   
     
-    class control(PointFootRoughCfg.control):
+    class control(TitaRoughCfg.control):
         control_type = "P_AND_V" # P: position, V: velocity, T: torques. 
                                  # P_AND_V: some joints use position control 
                                  # and others use vecocity control.
         # PD Drive parameters:
         stiffness = {
-            "abad_L_Joint": 40,
-            "hip_L_Joint": 40,
-            "knee_L_Joint": 40,
-            "abad_R_Joint": 40,
-            "hip_R_Joint": 40,
-            "knee_R_Joint": 40,
-            "wheel_L_Joint": 0.0,
-            "wheel_R_Joint": 0.0,
+            "joint_left_leg_1": 30,
+            "joint_left_leg_2": 30,
+            "joint_left_leg_3": 30,
+            "joint_right_leg_1": 30,
+            "joint_right_leg_2": 30,
+            "joint_right_leg_3": 30,
+            "joint_left_leg_4": 0.0,
+            "joint_right_leg_4": 0.0,
         }  # [N*m/rad]
         damping = {
-            "abad_L_Joint": 1.8,
-            "hip_L_Joint": 1.8,
-            "knee_L_Joint": 1.8,
-            "abad_R_Joint": 1.8,
-            "hip_R_Joint": 1.8,
-            "knee_R_Joint": 1.8,
-            "wheel_L_Joint": 0.5,
-            "wheel_R_Joint": 0.5,
+            "joint_left_leg_1": 0.5,
+            "joint_left_leg_2": 0.5,
+            "joint_left_leg_3": 0.5,
+            "joint_right_leg_1": 0.5,
+            "joint_right_leg_2": 0.5,
+            "joint_right_leg_3": 0.5,
+            "joint_left_leg_4": 0.5,
+            "joint_right_leg_4": 0.5,
         }  # [N*m*s/rad]
         # action scale: target angle = actionscale * action + defaultangle
         # action_scale_pos is the action scale of joints that use position control
@@ -74,20 +72,20 @@ class PointFootFlatCfg(PointFootRoughCfg):
         # decimation: Number of control action updates @ sim DT per policy DT
         decimation = 4       
 
-    class asset(PointFootRoughCfg.asset):
-        foot_name = "wheel"
-        foot_radius = 0.127
-        penalize_contacts_on = ["knee", "hip"]
-        terminate_after_contacts_on = ["abad", "base"]       
+    class asset(TitaRoughCfg.asset):
+        foot_name = "_leg_4"
+        foot_radius = 0.095
+        penalize_contacts_on = ["base_link", "_leg_3"]
+        terminate_after_contacts_on = ["base_link", "_leg_3"]       
         replace_cylinder_with_capsule = False       
         self_collisions = 0  # 1 to disable, 0 to enable...bitwise filter
     
-    class domain_rand(PointFootRoughCfg.domain_rand):
+    class domain_rand(TitaRoughCfg.domain_rand):
         friction_range = [0.2, 1.6]
         added_mass_range = [-0.5, 2]
         
-    class rewards(PointFootRoughCfg.rewards):
-        class scales(PointFootRoughCfg.rewards.scales):
+    class rewards(TitaRoughCfg.rewards):
+        class scales(TitaRoughCfg.rewards.scales):
             # base class
             lin_vel_z = 0.0 # off
             ang_vel_xy = 0.0 # off
@@ -117,23 +115,23 @@ class PointFootFlatCfg(PointFootRoughCfg):
             inclination = 0.0 # off
             leg_symmetry = 10.0
 
-        base_height_target = 0.65
+        base_height_target = 0.4
         soft_dof_pos_limit = 0.95  # percentage of urdf limits, values above this limit are penalized
         soft_dof_vel_limit = 1.0
-        min_feet_distance = 0.29
-        max_feet_distance = 0.32
-        tracking_sigma = 0.1  # tracking reward = exp(-error^2/sigma)
+        min_feet_distance = 0.57
+        max_feet_distance = 0.60
+        tracking_sigma = 0.1 # tracking reward = exp(-error^2/sigma)
         nominal_foot_position_tracking_sigma = 0.005
         nominal_foot_position_tracking_sigma_wrt_v = 0.5
-        base_height_target = 0.65 + 0.1664
+        # base_height_target = 0.65 + 0.1664
         leg_symmetry_tracking_sigma = 0.001
         foot_x_position_sigma = 0.001
 
-class PointFootFlatCfgPPO(PointFootRoughCfgPPO):
-    class policy(PointFootRoughCfgPPO.policy):
+class TitaFlatCfgPPO(TitaRoughCfgPPO):
+    class policy(TitaRoughCfgPPO.policy):
         actor_hidden_dims = [128, 64, 32]
         critic_hidden_dims = [128, 64, 32]
 
-    class runner(PointFootRoughCfgPPO.runner):
-        experiment_name = 'pointfoot_flat'
+    class runner(TitaRoughCfgPPO.runner):
+        experiment_name = 'tita_flat'
         max_iterations = 2000

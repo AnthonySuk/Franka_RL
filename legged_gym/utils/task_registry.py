@@ -158,21 +158,5 @@ class TaskRegistry():
             runner.load(resume_path)
         return runner, train_cfg
 
-    def save_cfgs(self, name):
-        if not os.path.exists(self.log_dir):
-            os.makedirs(self.log_dir)
-        robot_type = os.getenv("ROBOT_TYPE").split('_')[0]
-        task_type, terrain_type = name.split('_')[0], name.split('_')[1]
-        save_items = [
-            LEGGED_GYM_ENVS_DIR + "/{}/{}/{}/".format(task_type, terrain_type, robot_type) + "{}_config.py".format(name),
-            LEGGED_GYM_ENVS_DIR + "/{}/{}/".format(task_type, robot_type) + "{}.py".format(task_type),
-        ]
-        if save_items is not None:
-            try:
-                for save_item in save_items:
-                    base_file_name = ntpath.basename(save_item)
-                    copyfile(save_item, self.log_dir + "/" + base_file_name)
-            except FileNotFoundError:
-                pass
 # make global task registry
 task_registry = TaskRegistry()

@@ -9,8 +9,11 @@ from isaacgym.torch_utils import *
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs.base.base_task import BaseTask
 from legged_gym.utils.helpers import class_to_dict
-from legged_gym.utils.math import quat_apply_yaw, wrap_to_pi
+from legged_gym.utils.math import quat_apply_yaw, wrap_to_pi, euler_from_quat
 from legged_gym.utils.terrain import Terrain
+
+from collections import deque
+import numpy as np
 
 
 class TitaAirbotRobot:
@@ -105,6 +108,7 @@ class TitaAirbotRobot:
 
     def reset(self):
         """ Reset all robots"""
+        self.update_curr_ee_goal()
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
         obs, privileged_obs, _, _, _ = self.step(
             torch.zeros(self.num_envs, self.num_actions, device=self.device, requires_grad=False))
@@ -144,6 +148,7 @@ class TitaAirbotRobot:
         """
         clip_actions = self.cfg.normalization.clip_actions
         self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
+        self.actions[:,8:] = torch.clamp(self.actions[:,8:], self.dof_pos_limits[8:, 0], self.dof_pos_limits[8:, 1])
         # step physics and render each frame
         self.render()
         for _ in range(self.cfg.control.decimation):
@@ -152,6 +157,8 @@ class TitaAirbotRobot:
             self.gym.simulate(self.sim)
             self.gym.fetch_results(self.sim, True)
             self.gym.refresh_dof_state_tensor(self.sim)
+            self.refresh_ee_goal_variable()
+
         self.post_physics_step()
 
         # return clipped obs, clipped states (None), rewards, dones and infos
@@ -161,11 +168,13 @@ class TitaAirbotRobot:
             self.privileged_obs_buf = torch.clip(self.privileged_obs_buf, -clip_obs, clip_obs)
         return self.proprioceptive_obs_buf, self.privileged_obs_buf, self.rew_buf, self.reset_buf, self.extras
 
+    # 该函数计算奖励函数，观测值，检查单个机器人训练是否终止等
     def post_physics_step(self):
         """ check terminations, compute observations and rewards
             calls self._post_physics_step_callback() for common computations
             calls self._draw_debug_vis() if needed
         """
+        # 更新机器人状态以及接触力
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
@@ -175,16 +184,25 @@ class TitaAirbotRobot:
 
         # prepare quantities
         self.base_quat[:] = self.root_states[:, 3:7]
-        # add base position
+        # add base position 计算机器人坐标系下的基本状态
         self.base_position = self.root_states[:, :3]
         self.base_lin_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
+        self.dof_pos[:,[3, 7]]  = 0 
+
+        thigh_vel = self.dof_vel[:,[1,5]]
+        masked_vel = (torch.abs(thigh_vel) > self.cfg.rewards.oscillation_vel).float()
+        self.dof_vel_history.append(thigh_vel.clone() * masked_vel)
+
         if self.cfg.terrain.measure_heights_actor or self.cfg.terrain.measure_heights_critic:
             self.measured_heights = self._get_heights()
         self._compute_feet_states()
 
+        # 该函数主要对给训练机器人的指令进行设置
         self._post_physics_step_callback()
+
+        self.update_curr_ee_goal()
 
         # compute observations, rewards, resets, ...
         self.check_termination()
@@ -199,9 +217,12 @@ class TitaAirbotRobot:
         # add foot position and base position
         self.last_foot_positions[:] = self.foot_positions[:]
         self.last_base_position[:] = self.base_position[:]
+        self.last_foot_velocities[:] = self.foot_velocities[:]
 
-        if self.viewer and self.enable_viewer_sync and self.debug_viz:
-            self._draw_debug_vis()
+        if self.viewer:
+            self.gym.clear_lines(self.viewer)
+            self._draw_ee_goal_curr()
+            self._draw_ee_goal_traj()
 
     def _check_if_include_feet_height_rewards(self):
         members = [attr for attr in dir(self.cfg.rewards.scales) if not attr.startswith("__")]
@@ -218,6 +239,7 @@ class TitaAirbotRobot:
         # add orientation check
         # on_orientation = torch.abs(torch.norm(self.projected_gravity[:, :2], dim=-1) / self.projected_gravity[:, -1]) > 1
         # self.reset_buf |= on_orientation
+
         self.time_out_buf = self.episode_length_buf > self.max_episode_length  # no terminal reward for time-outs
         self.reset_buf |= self.time_out_buf
 
@@ -245,6 +267,7 @@ class TitaAirbotRobot:
         self._reset_root_states(env_ids)
 
         self._resample(env_ids)
+        self._resample_ee_goal(env_ids=env_ids,is_init=True)
 
         self._reset_buffers(env_ids)
         # fill extras
@@ -275,16 +298,22 @@ class TitaAirbotRobot:
         # add foot positions and base position
         self.last_foot_positions[env_ids] = self.foot_positions[env_ids]
         self.last_base_position[env_ids] = self.base_position[env_ids]
+        for h in self.dof_vel_history:
+            h[env_ids] = 0.0
 
     def compute_reward(self):
         """ Compute rewards
             Calls each reward function which had a non-zero scale (processed in self._prepare_reward_function())
             adds each terms to the episode sums and to the total reward
         """
+        # 初始化总奖励值为0
         self.rew_buf[:] = 0.
+        # 循环在_prepare_reward_function初始化的奖励函数字典
         for i in range(len(self.reward_functions)):
             name = self.reward_names[i]
+            # 运行对应函数并乘上权重因子
             rew = self.reward_functions[i]() * self.reward_scales[name]
+            # 之后进行加和
             self.rew_buf += rew
             self.episode_sums[name] += rew
         if self.cfg.rewards.only_positive_rewards:
@@ -327,15 +356,30 @@ class TitaAirbotRobot:
     def _compose_privileged_obs_buf_no_height_measure(self):
         #Wheel pos maybe unbounded when training,
         #since wheels are in velocity control mode, we don't wheel pos obs.
-        dof_pos_list = [0,1,2,
-                        4,5,6]
-        
-        self.privileged_obs_buf = torch.cat((self.base_ang_vel * self.obs_scales.ang_vel,
-                                             self.projected_gravity,
-                                             (self.dof_pos - self.default_dof_pos)[:,dof_pos_list] * self.obs_scales.dof_pos,
-                                             self.dof_vel * self.obs_scales.dof_vel, # 轮足相比点足扩展了2维，从6到8
-                                             self.actions, # 轮足相比点足扩展了2维，从6到8
-                                             self.commands[:, :3] * self.commands_scale,
+
+        ## torch.cat将多个张量沿指定维度拼接在一起。
+	    ## 观测量是：
+	    ## base_lin_vel机器人本体坐标系下的线性速度（x，y,z）
+	    ## commands机器人前三项命令，机器人坐标系x方向，y方向上的线速度，机器人z轴角速度
+	    ## 各关节速度
+	    ## 动作(各个关节的角度，角速度，力矩，与选择的控制模式有关)
+
+        self.dof_err = self.dof_pos - self.default_dof_pos
+        #self.dof_err[:,self.feet_indices] = 0
+
+        self.privileged_obs_buf = torch.cat((self.base_ang_vel * self.obs_scales.ang_vel, # base_ang_vel机器人本体坐标系下的角速度（w_x,w_y,w_z）
+                                             self.base_lin_vel * self.obs_scales.lin_vel,
+                                             self.projected_gravity, # projected_gravity机器人坐标系下的重力分量（g_x, g_y, g_z）
+                                             self.dof_err * self.obs_scales.dof_pos, # 各关节位置
+                                             self.dof_vel * self.obs_scales.dof_vel, # 各关节速度,轮足相比点足扩展了2维，从6到8
+                                             self.actions, # 动作(各个关节的角度，角速度，力矩，与选择的控制模式有关),轮足相比点足扩展了2维，从6到8
+                                             self.commands[:, :3] * self.commands_scale, # commands机器人前三项命令，机器人坐标系x方向，y方向上的线速度，机器人z轴角速度
+
+                                             self.curr_ee_goal_local,
+                                             self.ee_pos_local,
+                                            #  self.ee_orn,
+                                            #  self.ee_goal_orn_quat,
+                                             self.ee_pos_local - self.curr_ee_goal_local
                                              ), dim=-1)
 
     def compute_proprioceptive_observations(self):
@@ -357,16 +401,77 @@ class TitaAirbotRobot:
     def _compose_proprioceptive_obs_buf_no_height_measure(self):
         #Wheel pos maybe unbounded when training,
         #since wheels are in velocity control mode, we don't wheel pos obs.
-        dof_pos_list = [0,1,2,
-                        4,5,6]
-        # 写错了，应该是self.proprioceptive_obs_buf
+        self.dof_err = self.dof_pos - self.default_dof_pos
+        #self.dof_err[:,self.feet_indices] = 0
+
         self.proprioceptive_obs_buf = torch.cat((self.base_ang_vel * self.obs_scales.ang_vel,
-                                             self.projected_gravity,
-                                             (self.dof_pos - self.default_dof_pos)[:,dof_pos_list] * self.obs_scales.dof_pos,
-                                             self.dof_vel * self.obs_scales.dof_vel,
-                                             self.actions,
-                                             self.commands[:, :3] * self.commands_scale,
-                                             ), dim=-1)
+                                                 self.base_lin_vel * self.obs_scales.lin_vel,
+                                                 self.projected_gravity,
+                                                 self.dof_err * self.obs_scales.dof_pos,
+                                                 self.dof_vel * self.obs_scales.dof_vel,
+                                                 self.actions,
+                                                 self.commands[:, :3] * self.commands_scale,
+
+                                                 self.curr_ee_goal_local,
+                                                 self.ee_pos_local,
+                                                #  self.ee_orn,
+                                                #  self.ee_goal_orn_quat,
+                                                 self.ee_pos_local - self.curr_ee_goal_local
+                                                 ), dim=-1)
+
+    def _get_noise_scale_vec(self):
+        """ Sets a vector used to scale the noise added to the observations.
+            [NOTE]: Must be adapted when changing the observations structure
+
+        Args:
+            cfg (Dict): Environment config file
+
+        Returns:
+            [torch.Tensor]: Vector of scales used to multiply a uniform distribution in [-1, 1]
+        """
+        obs_noise_vec = torch.zeros(self.cfg.env.num_propriceptive_obs, device=self.device)
+        self.add_noise = self.cfg.noise.add_noise
+        noise_scales = self.cfg.noise.noise_scales
+        noise_level = self.cfg.noise.noise_level
+
+        obs_noise_vec[:3] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
+
+        obs_noise_vec[3:6] = noise_scales.lin_vel * noise_level * self.obs_scales.lin_vel
+
+        obs_noise_vec[3:6] = noise_scales.gravity * noise_level
+
+        dof_pos_end_idx = 6 + self.num_dof
+        obs_noise_vec[6:dof_pos_end_idx] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
+
+        dof_vel_end_idx = dof_pos_end_idx + self.num_dof
+        obs_noise_vec[dof_pos_end_idx:dof_vel_end_idx] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
+
+        last_action_end_idx = dof_vel_end_idx + self.num_actions
+        obs_noise_vec[dof_vel_end_idx:last_action_end_idx] = 0.  # previous actions
+
+        command_end_idx = last_action_end_idx + self.cfg.commands.num_commands
+        obs_noise_vec[last_action_end_idx:command_end_idx] = 0.  # commands
+        
+        if self.cfg.env.num_privileged_obs is not None:
+            privileged_extra_obs_noise_vec = torch.zeros(
+                self.cfg.env.num_privileged_obs - self.cfg.env.num_propriceptive_obs, device=self.device)
+        else:
+            privileged_extra_obs_noise_vec = None
+
+        if self.cfg.terrain.measure_heights_actor:
+            measure_heights_end_idx = last_action_end_idx + len(self.cfg.terrain.measured_points_x) * len(
+                self.cfg.terrain.measured_points_y)
+            obs_noise_vec[
+            last_action_end_idx:measure_heights_end_idx] = noise_scales.height_measurements * noise_level * self.obs_scales.height_measurements
+
+        if self.cfg.terrain.measure_heights_critic:
+            if self.cfg.env.num_privileged_obs is not None:
+                privileged_extra_obs_noise_vec[
+                :len(self.cfg.terrain.measured_points_x) * len(
+                    self.cfg.terrain.measured_points_y)] = noise_scales.height_measurements * noise_level * self.obs_scales.height_measurements
+
+        return obs_noise_vec, privileged_extra_obs_noise_vec
+
 
     def create_sim(self):
         """ Creates simulation, terrain and environments
@@ -467,15 +572,18 @@ class TitaAirbotRobot:
         """ Callback called before computing terminations, rewards, and observations
             Default behaviour: Compute ang vel command based on target and heading, compute measured terrain heights and randomly push robots
         """
-        #
+        # 当前的训练周期处以设置的重采样周期，选出能够整除的机器人序号
         env_ids = (self.episode_length_buf % int(self.cfg.commands.resampling_time / self.dt) == 0).nonzero(
             as_tuple=False).flatten()
+        
+        # 给训练机器人随机选择一些指令
         self._resample(env_ids)
+        # 如果是给航向角命令，也是通过期望航向角和当前航向角算出期望z轴角速度
         if self.cfg.commands.heading_command:
             forward = quat_apply(self.base_quat, self.forward_vec)
             heading = torch.atan2(forward[:, 1], forward[:, 0])
             self.commands[:, 2] = torch.clip(0.5 * wrap_to_pi(self.commands[:, 3] - heading), -1., 1.)
-
+        # 随机给机器人施加推力
         if self.cfg.domain_rand.push_robots and (self.common_step_counter % self.cfg.domain_rand.push_interval == 0):
             self._push_robots()
 
@@ -488,6 +596,8 @@ class TitaAirbotRobot:
         Args:
             env_ids (List[int]): Environments ids for which new commands are needed
         """
+        # command顺序在机器人坐标系x方向，y方向上的线速度，机器人z轴角速度，期望航向角四个命令
+        # 在命令的上下限中随机生成一个值
         self.commands[env_ids, 0] = torch_rand_float(self.command_ranges["lin_vel_x"][0],
                                                      self.command_ranges["lin_vel_x"][1], (len(env_ids), 1),
                                                      device=self.device).squeeze(1)
@@ -502,9 +612,9 @@ class TitaAirbotRobot:
             self.commands[env_ids, 2] = torch_rand_float(self.command_ranges["ang_vel_yaw"][0],
                                                          self.command_ranges["ang_vel_yaw"][1], (len(env_ids), 1),
                                                          device=self.device).squeeze(1)
-
+        # 在机器人坐标系x方向，y方向上的线速度命令过小则置为0，目前的比较值是0.2
         # set small commands to zero
-        self.commands[env_ids, :2] *= (torch.norm(self.commands[env_ids, :2], dim=1) > 0.2).unsqueeze(1)
+        self.commands[env_ids, :3] *= (torch.norm(self.commands[env_ids, :2], dim=1) > 0.4).unsqueeze(1)
 
     def _compute_torques(self, actions):
         """ Compute torques from actions.
@@ -528,6 +638,8 @@ class TitaAirbotRobot:
             # We only care about wheels velocity, so velocity control mode is used.
             V_list = [3,7]
             torques[:,V_list] = self.d_gains[V_list]*(action_scale_vel* actions[:,V_list] - self.dof_vel[:,V_list])
+            # aribot torque
+            torques[:,8:] = self.p_gains[8:] * (actions[:,8:] - self.dof_pos[:,8:]) - self.d_gains[8:] * self.dof_vel[:,8:]
         else:
             raise NameError(f"Unknown controller type: {control_type}")
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
@@ -635,51 +747,6 @@ class TitaAirbotRobot:
             self.command_ranges["lin_vel_x"][1] = np.clip(self.command_ranges["lin_vel_x"][1] + 0.5, 0.,
                                                           self.cfg.commands.max_curriculum)
 
-    def _get_noise_scale_vec(self):
-        """ Sets a vector used to scale the noise added to the observations.
-            [NOTE]: Must be adapted when changing the observations structure
-
-        Args:
-            cfg (Dict): Environment config file
-
-        Returns:
-            [torch.Tensor]: Vector of scales used to multiply a uniform distribution in [-1, 1]
-        """
-        obs_noise_vec = torch.zeros(self.cfg.env.num_propriceptive_obs, device=self.device)
-        self.add_noise = self.cfg.noise.add_noise
-        noise_scales = self.cfg.noise.noise_scales
-        noise_level = self.cfg.noise.noise_level
-        obs_noise_vec[:3] = noise_scales.lin_vel * noise_level * self.obs_scales.lin_vel
-        obs_noise_vec[3:6] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
-        obs_noise_vec[6:9] = noise_scales.gravity * noise_level
-        command_end_idx = 9 + self.cfg.commands.num_commands
-        obs_noise_vec[9:command_end_idx] = 0.  # commands
-        dof_pos_end_idx = command_end_idx + self.num_dof
-        obs_noise_vec[command_end_idx:dof_pos_end_idx] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
-        dof_vel_end_idx = dof_pos_end_idx + self.num_dof
-        obs_noise_vec[dof_pos_end_idx:dof_vel_end_idx] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
-        last_action_end_idx = dof_vel_end_idx + self.num_actions
-        obs_noise_vec[dof_vel_end_idx:last_action_end_idx] = 0.  # previous actions
-        if self.cfg.env.num_privileged_obs is not None:
-            privileged_extra_obs_noise_vec = torch.zeros(
-                self.cfg.env.num_privileged_obs - self.cfg.env.num_propriceptive_obs, device=self.device)
-        else:
-            privileged_extra_obs_noise_vec = None
-
-        if self.cfg.terrain.measure_heights_actor:
-            measure_heights_end_idx = last_action_end_idx + len(self.cfg.terrain.measured_points_x) * len(
-                self.cfg.terrain.measured_points_y)
-            obs_noise_vec[
-            last_action_end_idx:measure_heights_end_idx] = noise_scales.height_measurements * noise_level * self.obs_scales.height_measurements
-
-        if self.cfg.terrain.measure_heights_critic:
-            if self.cfg.env.num_privileged_obs is not None:
-                privileged_extra_obs_noise_vec[
-                :len(self.cfg.terrain.measured_points_x) * len(
-                    self.cfg.terrain.measured_points_y)] = noise_scales.height_measurements * noise_level * self.obs_scales.height_measurements
-
-        return obs_noise_vec, privileged_extra_obs_noise_vec
-
     # ----------------------------------------
     def _init_buffers(self):
         """ Initialize torch tensors which will contain simulation states and processed quantities
@@ -699,11 +766,16 @@ class TitaAirbotRobot:
         self.root_states = gymtorch.wrap_tensor(actor_root_state)
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
+        self.dof_vel_history = deque(maxlen=self.cfg.rewards.dof_vel_history_length)
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 1]
         self.base_quat = self.root_states[:, 3:7]
+        base_yaw = get_euler_xyz(self.base_quat)[2]
+        self.base_yaw_eular = torch.cat([torch.zeros(self.num_envs, 2, device=self.device), base_yaw.view(-1, 1)], dim=1)
+        self.base_yaw_quat = quat_from_euler_xyz(torch.tensor(0), torch.tensor(0), base_yaw)
         self.rigid_body_states = gymtorch.wrap_tensor(rigid_body_state).view(
             self.num_envs, self.num_bodies, -1
         )
+        
         self.feet_state = self.rigid_body_states[:, self.feet_indices, :]
         # add foot positions and base positions
         self.base_position = self.root_states[:, :3]
@@ -714,6 +786,7 @@ class TitaAirbotRobot:
         self.last_foot_positions = torch.zeros_like(self.foot_positions)
         self.foot_heights = torch.zeros_like(self.foot_positions)
         self.foot_velocities = torch.zeros_like(self.foot_positions)
+        self.last_foot_velocities = torch.zeros_like(self.foot_velocities)
         self.foot_velocities_f = torch.zeros_like(self.foot_positions)
         self.foot_relative_velocities = torch.zeros_like(self.foot_velocities)
         
@@ -790,6 +863,24 @@ class TitaAirbotRobot:
                     print(f"PD gain of joint {name} were not defined, setting them to zero")
         self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
 
+        self.init_ee_goal_variale()
+
+        self.last_leg_oscillation_reward = torch.zeros(self.num_envs, self.feet_indices.shape[0],device=self.device)
+        self.com_tita = torch.zeros(self.num_envs, 3, device = self.device)
+        self.com_arm = torch.zeros(self.num_envs, 3, device = self.device)
+
+        rigid_body_mass = []
+        for env_handle, actor_handle in zip(self.envs, self.actor_handles):
+            body_props = self.gym.get_actor_rigid_body_properties(env_handle, actor_handle)
+            masses = torch.tensor([p.mass for p in body_props], dtype=torch.float32)  # [num_bodies]
+            rigid_body_mass.append(masses)
+        rigid_body_mass = torch.stack(rigid_body_mass, dim=0).unsqueeze(-1)
+
+        self.rigid_body_mass_tita = rigid_body_mass[:,:9]
+        self.rigid_body_mass_tita = self.rigid_body_mass_tita.to(self.device)
+        self.rigid_body_mass_arm = rigid_body_mass[:,9:]
+        self.rigid_body_mass_arm = self.rigid_body_mass_arm.to(self.device)
+
     def _prepare_reward_function(self):
         """ Prepares a list of reward functions, whcih will be called to compute the total reward.
             Looks for self._reward_<REWARD_NAME>, where <REWARD_NAME> are names of all non zero reward scales in the cfg.
@@ -810,7 +901,10 @@ class TitaAirbotRobot:
             self.reward_names.append(name)
             name = '_reward_' + name
             self.reward_functions.append(getattr(self, name))
-
+        
+        # self.episode_sums字典将包含与self.reward_scales字典相同数量的键
+        # 但每个键都将映射到一个大小为 (self.num_envs) 的全零浮点数张量
+        # 张量将用于在训练过程中累积每个环境的奖励。
         # reward episode sums
         self.episode_sums = {
             name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
@@ -898,9 +992,16 @@ class TitaAirbotRobot:
         self.num_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
         dof_props_asset = self.gym.get_asset_dof_properties(robot_asset)
         rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(robot_asset)
+        # # 添加打印关节名称的代码
+        # self.dof_names = self.gym.get_asset_dof_names(robot_asset)
+        # print("加载的关节名称:")
+        # for i, name in enumerate(self.dof_names):  # <--- 新增索引打印
+        #     print(f"索引 {i}: {name}") 
+        
 
         # save body names from the asset
         body_names = self.gym.get_asset_rigid_body_names(robot_asset)
+        self.body_names_to_idx = self.gym.get_asset_rigid_body_dict(robot_asset)
         self.dof_names = self.gym.get_asset_dof_names(robot_asset)
         self.num_bodies = len(body_names)
         self.num_dofs = len(self.dof_names)
@@ -920,6 +1021,8 @@ class TitaAirbotRobot:
         self.base_mass = torch.zeros(
             self.num_envs, dtype=torch.float, device=self.device, requires_grad=False
         )
+
+        self.gripper_idx = self.body_names_to_idx[self.cfg.asset.end_effector_name]
 
         self._get_env_origins()
         env_lower = gymapi.Vec3(0., 0., 0.)
@@ -1004,6 +1107,7 @@ class TitaAirbotRobot:
         self.max_episode_length = np.ceil(self.max_episode_length_s / self.dt)
 
         self.cfg.domain_rand.push_interval = np.ceil(self.cfg.domain_rand.push_interval_s / self.dt)
+        self.goal_ee_ranges = class_to_dict(self.cfg.goal_ee.ranges)
 
     def _draw_debug_vis(self):
         """ Draws visualizations for dubugging (slows down simulation a lot).
@@ -1129,15 +1233,268 @@ class TitaAirbotRobot:
         self.first_contact = (self.feet_air_time > 0.) * self.contact_filt
         self.feet_air_time += self.dt
 
-    # ------------ reward functions----------------
-    def _reward_lin_vel_z(self):
-        # Penalize z axis base linear velocity
-        return torch.square(self.base_lin_vel[:, 2])
+    # ------------ ee goal related ------------
+    def init_ee_goal_variale(self):
+        # ee info
+        self.ee_pos = self.rigid_body_states[:, self.gripper_idx, :3]
+        self.ee_orn = self.rigid_body_states[:, self.gripper_idx, 3:7]
+        self.ee_default_orn = self.ee_orn.clone()
+        self.ee_vel = self.rigid_body_states[:, self.gripper_idx, 7:]
 
-    def _reward_ang_vel_xy(self):
-        # Penalize xy axes base angular velocity
-        return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
+        self.z_invariant_offset = torch.tensor([self.cfg.goal_ee.sphere_center.z_invariant_offset], device=self.device).repeat(self.num_envs, 1)
+        self.ee_pos_local = quat_rotate_inverse(self.base_yaw_quat, self.ee_pos - torch.cat([self.root_states[:, :2], self.z_invariant_offset], dim=1))
+      
+        # time setting
+        self.goal_timer = torch.zeros(self.num_envs, device=self.device)
+        self.traj_timesteps = torch_rand_float(self.cfg.goal_ee.traj_time[0], self.cfg.goal_ee.traj_time[1], (self.num_envs, 1), 
+                                               device=self.device).squeeze(1) / self.dt
+        self.traj_total_timesteps = self.traj_timesteps + torch_rand_float(self.cfg.goal_ee.hold_time[0], self.cfg.goal_ee.hold_time[1], 
+                                                                           (self.num_envs, 1), device=self.device).squeeze(1) / self.dt
+        
+        # target_ee info
+        self.init_start_ee_sphere = torch.tensor(self.cfg.goal_ee.ranges.init_pos_start, device=self.device).unsqueeze(0)
+        self.init_end_ee_sphere = torch.tensor(self.cfg.goal_ee.ranges.init_pos_end, device=self.device).unsqueeze(0)
 
+        self.ee_start_sphere = torch.zeros(self.num_envs, 3, device=self.device)
+        self.ee_goal_cart = torch.zeros(self.num_envs, 3, device=self.device)
+        self.ee_goal_sphere = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        self.ee_goal_orn_euler = torch.zeros(self.num_envs, 3, device=self.device)
+        self.ee_goal_orn_euler[:, 0] = 0#np.pi / 2
+        self.ee_goal_orn_euler[:, 1] = np.pi / 2
+        self.ee_goal_orn_euler[:, 2] = np.pi / 2
+        self.ee_goal_orn_quat = quat_from_euler_xyz(self.ee_goal_orn_euler[:, 0], self.ee_goal_orn_euler[:, 1], self.ee_goal_orn_euler[:, 2])
+        self.ee_goal_orn_delta_rpy = torch.zeros(self.num_envs, 3, device=self.device)
+        self.ee_goal_center_offset = torch.tensor([self.cfg.goal_ee.sphere_center.x_offset, 
+                                                   self.cfg.goal_ee.sphere_center.y_offset, 
+                                                   self.cfg.goal_ee.sphere_center.z_invariant_offset], 
+                                                   device=self.device).repeat(self.num_envs, 1)
+        
+        self.curr_ee_goal_cart = torch.zeros(self.num_envs, 3, device=self.device)
+        self.curr_ee_goal_sphere = torch.zeros(self.num_envs, 3, device=self.device)
+        self.curr_ee_goal_cart_world = self._get_ee_goal_spherical_center() + quat_apply(self.base_yaw_quat, self.curr_ee_goal_cart)
+        self.curr_ee_goal_local = quat_rotate_inverse(self.base_yaw_quat, self.curr_ee_goal_cart_world - torch.cat([self.root_states[:, :2], self.z_invariant_offset], dim=1))
+
+        if self.cfg.goal_ee.command_mode == 'cart':
+            self.curr_ee_goal = self.curr_ee_goal_cart
+        else:
+            self.curr_ee_goal = self.curr_ee_goal_sphere
+
+        self.arm_u = torch.zeros((self.num_envs,self.num_dofs),dtype=torch.float,device=self.device)
+        
+        # collision setting
+        self.collision_lower_limits = torch.tensor(self.cfg.goal_ee.collision_lower_limits, device=self.device, dtype=torch.float)
+        self.collision_upper_limits = torch.tensor(self.cfg.goal_ee.collision_upper_limits, device=self.device, dtype=torch.float)
+        self.underground_limit = self.cfg.goal_ee.underground_limit
+        self.num_collision_check_samples = self.cfg.goal_ee.num_collision_check_samples
+        self.collision_check_t = torch.linspace(0, 1, self.num_collision_check_samples, device=self.device)[None, None, :]
+        assert(self.cfg.goal_ee.command_mode in ['cart', 'sphere'])
+
+        # error scale
+        self.sphere_error_scale = torch.tensor(self.cfg.goal_ee.sphere_error_scale, device=self.device)
+        self.orn_error_scale = torch.tensor(self.cfg.goal_ee.orn_error_scale, device=self.device)
+
+        # curriculum setting
+        self.max_target_l = self.goal_ee_ranges["pos_l"][1]
+        self.max_target_p = self.goal_ee_ranges["pos_p"][1] if abs(self.goal_ee_ranges["pos_p"][1]) > abs(self.goal_ee_ranges["pos_p"][0]) else self.goal_ee_ranges["pos_p"][0]
+        self.max_target_y = self.goal_ee_ranges["pos_y"][1]
+
+        height_tensor = torch.tensor([self.cfg.rewards.base_height_target], device=self.device)
+        ee_pos_local = torch.cat([self.ee_pos[0,:2] - self.base_position[0,:2],
+                                  height_tensor], 
+                                  dim=0)
+        init_ee_l_sphere = torch.norm(ee_pos_local - self.ee_goal_center_offset[0])
+        self.mean_l = init_ee_l_sphere
+        self.mean_p = 0. #(self.goal_ee_ranges["pos_p"][1] + self.goal_ee_ranges["pos_p"][0]) / 2.
+        self.mean_y = 0.
+
+        self.curriculum_progress = self.common_step_counter / (23. * self.cfg.goal_ee.curriculum_length)
+
+        self._resample_ee_goal(torch.arange(self.num_envs, device=self.device), is_init=True)
+        
+    def _reset_ee_goal_start(self):
+        if self.curriculum_progress < 1.:
+            self.curriculum_progress = self.common_step_counter / (23. * self.cfg.goal_ee.curriculum_length)
+
+        variance_l = (1. +  self.max_target_l**2) * self.curriculum_progress
+        variance_p = (1. +  self.max_target_p**2) * self.curriculum_progress 
+        variance_y = (1. +  self.max_target_y**2) * self.curriculum_progress
+
+        l = torch.normal(mean=self.mean_l, std=variance_l, size=())
+        p = torch.normal(mean=self.mean_p, std=variance_p, size=())
+        y = torch.normal(mean=self.mean_y, std=variance_y, size=())
+
+        if l > self.goal_ee_ranges["pos_l"][1]:
+            l = self.goal_ee_ranges["pos_l"][1]
+        if l < self.mean_l:
+            l = self.mean_l
+        
+        if p > self.goal_ee_ranges["pos_p"][1]:
+            p = self.goal_ee_ranges["pos_p"][1]
+        if p < self.goal_ee_ranges["pos_p"][0]:
+            p = self.goal_ee_ranges["pos_p"][0]
+
+        if y > self.goal_ee_ranges["pos_y"][1]:
+            y = self.goal_ee_ranges["pos_y"][1]
+        if y < self.goal_ee_ranges["pos_y"][0]:
+            y = self.goal_ee_ranges["pos_y"][0]
+        
+        return torch.tensor([l,p,y], device=self.device)
+
+    def _get_ee_goal_spherical_center(self):
+        center = torch.cat([self.root_states[:, :2], torch.zeros(self.num_envs, 1, device=self.device)], dim=1)
+        center = center + quat_apply(self.base_yaw_quat, self.ee_goal_center_offset)
+        return center
+    
+    def cart2sphere(self, cart):
+        sphere = torch.zeros_like(cart)
+        radius = torch.norm(cart, dim=-1)
+        radius = torch.clamp(radius, min=1e-6)  # prevent division by 0
+        sphere[:, 0] = radius
+        sphere[:, 1] = torch.atan2(cart[:, 2], cart[:, 0])  # yaw
+        y_ratio = torch.clamp(cart[:, 1] / radius, -1.0, 1.0)  # clamp to asin domain
+        sphere[:, 2] = torch.asin(y_ratio)  # pitch
+        return sphere
+
+    def sphere2cart(self,sphere):
+        if sphere.ndim == 1:
+            sphere = sphere.view(1, -1)  # or use unsqueeze(0)
+        cart = torch.zeros_like(sphere)
+        cart[:, 0] = sphere[:, 0] * torch.cos(sphere[:, 2]) * torch.cos(sphere[:, 1])
+        cart[:, 1] = sphere[:, 0] * torch.sin(sphere[:, 2])
+        cart[:, 2] = sphere[:, 0] * torch.cos(sphere[:, 2]) * torch.sin(sphere[:, 1])
+        return cart
+    
+    def refresh_ee_goal_variable(self):
+        self.gym.refresh_dof_state_tensor(self.sim)
+        self.gym.refresh_jacobian_tensors(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+
+        self.base_quat = self.root_states[:, 3:7]
+        self.ee_pos = self.rigid_body_states[:, self.gripper_idx, :3]
+        self.ee_orn = self.rigid_body_states[:, self.gripper_idx, 3:7]
+
+        base_yaw = get_euler_xyz(self.base_quat)[2]
+        self.base_yaw_fixed = wrap_to_pi(base_yaw).view(self.num_envs,1)
+        self.base_yaw_quat[:] = quat_from_euler_xyz(torch.tensor(0), torch.tensor(0), base_yaw)
+        self.base_yaw_eular = torch.cat([torch.zeros(self.num_envs, 2, device=self.device), base_yaw.view(-1, 1)], dim=1)
+
+        self.ee_pos_local = quat_rotate_inverse(self.base_yaw_quat, self.ee_pos - torch.cat([self.root_states[:, :2], self.z_invariant_offset], dim=1))
+      
+    def update_curr_ee_goal(self):
+        self.refresh_ee_goal_variable()
+        t = torch.clip(self.goal_timer / self.traj_timesteps, 0, 1)
+        self.curr_ee_goal_sphere[:] = torch.lerp(self.ee_start_sphere, self.ee_goal_sphere, t[:, None])
+
+        self.curr_ee_goal_cart[:] = self.sphere2cart(self.curr_ee_goal_sphere)
+        ee_goal_cart_yaw_global = quat_apply(self.base_yaw_quat, self.curr_ee_goal_cart)
+        self.curr_ee_goal_cart_world = self._get_ee_goal_spherical_center() + ee_goal_cart_yaw_global
+        self.curr_ee_goal_local = quat_rotate_inverse(self.base_yaw_quat, self.curr_ee_goal_cart_world - torch.cat([self.root_states[:, :2], self.z_invariant_offset], dim=1))
+        
+        default_yaw = torch.atan2(ee_goal_cart_yaw_global[:, 1], ee_goal_cart_yaw_global[:, 0])
+        #self.ee_goal_orn_quat = quat_from_euler_xyz(self.ee_goal_orn_delta_rpy[:, 0] + np.pi / 2, self.ee_goal_orn_delta_rpy[:, 1], self.ee_goal_orn_delta_rpy[:, 2] + default_yaw)
+        self.ee_goal_orn_quat = quat_from_euler_xyz(self.ee_goal_orn_delta_rpy[:, 0] , self.ee_goal_orn_delta_rpy[:, 1], self.ee_goal_orn_delta_rpy[:, 2] + default_yaw)
+
+        self.goal_timer += 1
+
+        resample_id = (self.goal_timer > self.traj_total_timesteps).nonzero(as_tuple=False).flatten()
+
+        if len(resample_id) > 0 and self.cfg.goal_ee.stop_update_goal:
+            # set these env commands as 0
+            self.commands[resample_id, 0] = 0
+            self.commands[resample_id, 2] = 0
+
+        self._resample_ee_goal(resample_id)
+    
+    def _resample_ee_goal(self, env_ids, is_init=False):
+        if len(env_ids) > 0:
+            init_env_ids = env_ids.clone()
+            
+            if is_init:
+                self.ee_goal_orn_delta_rpy[env_ids, :] = 0
+                self.ee_start_sphere[env_ids] = self._reset_ee_goal_start()
+            else:
+                #self._resample_ee_goal_orn_once(env_ids)
+                self.ee_start_sphere[env_ids] = self.ee_goal_sphere[env_ids].clone()
+
+            for i in range(10):
+                    self._resample_ee_goal_sphere_once(env_ids)
+                    collision_mask = self.collision_check(env_ids)
+                    env_ids = env_ids[collision_mask]
+                    if len(env_ids) == 0:
+                        break
+
+            self.ee_goal_cart[init_env_ids, :] = self.sphere2cart(self.ee_goal_sphere[init_env_ids, :])
+            self.goal_timer[init_env_ids] = 0.0
+
+    def _resample_ee_goal_sphere_once(self, env_ids):
+        self.ee_goal_sphere[env_ids, 0] = torch_rand_float(self.goal_ee_ranges["pos_l"][0], self.goal_ee_ranges["pos_l"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+        self.ee_goal_sphere[env_ids, 1] = torch_rand_float(self.goal_ee_ranges["pos_p"][0], self.goal_ee_ranges["pos_p"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+        self.ee_goal_sphere[env_ids, 2] = torch_rand_float(self.goal_ee_ranges["pos_y"][0], self.goal_ee_ranges["pos_y"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+
+    def _resample_ee_goal_orn_once(self, env_ids):
+        ee_goal_delta_orn_r = torch_rand_float(self.goal_ee_ranges["delta_orn_r"][0], self.goal_ee_ranges["delta_orn_r"][1], (len(env_ids), 1), device=self.device)
+        ee_goal_delta_orn_p = torch_rand_float(self.goal_ee_ranges["delta_orn_p"][0], self.goal_ee_ranges["delta_orn_p"][1], (len(env_ids), 1), device=self.device)
+        ee_goal_delta_orn_y = torch_rand_float(self.goal_ee_ranges["delta_orn_y"][0], self.goal_ee_ranges["delta_orn_y"][1], (len(env_ids), 1), device=self.device)
+        self.ee_goal_orn_delta_rpy[env_ids, :] = torch.cat([ee_goal_delta_orn_r, ee_goal_delta_orn_p, ee_goal_delta_orn_y], dim=-1)
+
+    def collision_check(self, env_ids):
+        ee_target_all_sphere = torch.lerp(self.ee_start_sphere[env_ids, ..., None], self.ee_goal_sphere[env_ids, ...,  None], self.collision_check_t).squeeze(-1)
+        ee_target_cart = self.sphere2cart(torch.permute(ee_target_all_sphere, (2, 0, 1)).reshape(-1, 3)).reshape(self.num_collision_check_samples, -1, 3)
+        collision_mask = torch.any(torch.logical_and(torch.all(ee_target_cart < self.collision_upper_limits, dim=-1), torch.all(ee_target_cart > self.collision_lower_limits, dim=-1)), dim=0)
+        underground_mask = torch.any(ee_target_cart[..., 2] < self.underground_limit, dim=0)
+        return collision_mask | underground_mask
+    
+    def _draw_ee_goal_traj(self):
+        sphere_geom = gymutil.WireframeSphereGeometry(0.005, 8, 8, None, color=(1, 0, 0))
+        sphere_geom_yellow = gymutil.WireframeSphereGeometry(0.01, 16, 16, None, color=(1, 1, 0))
+
+        t = torch.linspace(0, 1, 10, device=self.device)[None, None, None, :]
+        ee_target_all_sphere = torch.lerp(self.ee_start_sphere[..., None], self.ee_goal_sphere[..., None], t).squeeze(0)
+        ee_target_all_cart_world = torch.zeros_like(ee_target_all_sphere)
+        for i in range(10):
+            ee_target_cart = self.sphere2cart(ee_target_all_sphere[..., i])
+            ee_target_all_cart_world[..., i] = quat_apply(self.base_yaw_quat, ee_target_cart)
+        ee_target_all_cart_world += self._get_ee_goal_spherical_center()[:, :, None]
+        for i in range(self.num_envs):
+            for j in range(10):
+                pose = gymapi.Transform(gymapi.Vec3(ee_target_all_cart_world[i, 0, j], ee_target_all_cart_world[i, 1, j], ee_target_all_cart_world[i, 2, j]), r=None)
+                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], pose)
+
+    def _draw_ee_goal_curr(self):
+        """ Draws visualizations for dubugging (slows down simulation a lot).
+            Default behaviour: draws height measurement points
+        """
+        sphere_geom = gymutil.WireframeSphereGeometry(0.05, 4, 4, None, color=(1, 1, 0))
+
+        sphere_geom_3 = gymutil.WireframeSphereGeometry(0.05, 16, 16, None, color=(0, 1, 1))
+        upper_arm_pose = self._get_ee_goal_spherical_center()
+
+        sphere_geom_2 = gymutil.WireframeSphereGeometry(0.05, 4, 4, None, color=(0, 0, 1))
+        ee_pose = self.rigid_body_states[:, self.gripper_idx, :3]
+        
+       
+        sphere_geom_origin = gymutil.WireframeSphereGeometry(0.1, 8, 8, None, color=(0, 1, 0))
+        sphere_pose = gymapi.Transform(gymapi.Vec3(0, 0, 0), r=None)
+        gymutil.draw_lines(sphere_geom_origin, self.gym, self.viewer, self.envs[0], sphere_pose)  # Green ball
+
+        axes_geom = gymutil.AxesGeometry(scale=0.2)
+
+        for i in range(self.num_envs):
+            sphere_pose = gymapi.Transform(gymapi.Vec3(self.curr_ee_goal_cart_world[i, 0], self.curr_ee_goal_cart_world[i, 1], self.curr_ee_goal_cart_world[i, 2]), r=None)
+            gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose) 
+            
+            sphere_pose_2 = gymapi.Transform(gymapi.Vec3(ee_pose[i, 0], ee_pose[i, 1], ee_pose[i, 2]), r=None)
+            gymutil.draw_lines(sphere_geom_2, self.gym, self.viewer, self.envs[i], sphere_pose_2) 
+
+            sphere_pose_3 = gymapi.Transform(gymapi.Vec3(upper_arm_pose[i, 0], upper_arm_pose[i, 1], upper_arm_pose[i, 2]), r=None)
+            gymutil.draw_lines(sphere_geom_3, self.gym, self.viewer, self.envs[i], sphere_pose_3) 
+
+            pose = gymapi.Transform(gymapi.Vec3(self.curr_ee_goal_cart_world[i, 0], self.curr_ee_goal_cart_world[i, 1], self.curr_ee_goal_cart_world[i, 2]), 
+                                    r=gymapi.Quat(self.ee_goal_orn_quat[i, 0], self.ee_goal_orn_quat[i, 1], self.ee_goal_orn_quat[i, 2], self.ee_goal_orn_quat[i, 3]))
+            gymutil.draw_lines(axes_geom, self.gym, self.viewer, self.envs[i], pose)
+
+    # ------------ tita reward functions----------------
     def _reward_orientation(self):
         # Penalize non flat base orientation
         return torch.norm(self.projected_gravity[:, :2], dim=1) > 0.1
@@ -1152,14 +1509,12 @@ class TitaAirbotRobot:
         # Penalize torques
         return torch.sum(torch.square(self.torques), dim=1)
 
-    def _reward_dof_vel(self):
-        # Penalize dof velocities
-        return torch.sum(torch.square(self.dof_vel), dim=1)
-
     def _reward_dof_acc(self):
         # Penalize dof accelerations
-        return torch.sum(torch.square((self.last_dof_vel - self.dof_vel) / self.dt), dim=1)
-
+        vel_diff = self.last_dof_vel - self.dof_vel
+        vel_diff[:,8:] = 0
+        return torch.sum(torch.square(vel_diff / self.dt), dim=1)
+    
     def _reward_action_rate(self):
         # Penalize changes in actions
         return torch.sum(torch.square(self.last_actions - self.actions), dim=1)
@@ -1171,33 +1526,16 @@ class TitaAirbotRobot:
         # change to reward not penalize
         return torch.sum((torch.norm(self.contact_forces[:, self.penalised_contact_indices, :], dim=-1) > 0.1), dim=1)
 
-    def _reward_termination(self):
-        # Terminal reward / penalty
-        return self.reset_buf * ~self.time_out_buf
-
     def _reward_dof_pos_limits(self):
         # Penalize dof positions too close to the limit
         out_of_limits = -(self.dof_pos - self.dof_pos_limits[:, 0]).clip(max=0.)  # lower limit
         out_of_limits += (self.dof_pos - self.dof_pos_limits[:, 1]).clip(min=0.)
         return torch.sum(out_of_limits, dim=1)
 
-    def _reward_dof_vel_limits(self):
-        # Penalize dof velocities too close to the limit
-        # clip to max error = 1 rad/s per joint to avoid huge penalties
-        return torch.sum(
-            (torch.abs(self.dof_vel) - self.dof_vel_limits * self.cfg.rewards.soft_dof_vel_limit).clip(min=0., max=1.),
-            dim=1)
-
-    def _reward_torque_limits(self):
-        # penalize torques too close to the limit
-        return torch.sum(
-            (torch.abs(self.torques) - self.torque_limits * self.cfg.rewards.soft_torque_limit).clip(min=0.), dim=1)
-
     def _reward_tracking_lin_vel(self):
         # Tracking of linear velocity commands (xy axes)
         lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
-        # 只惩罚y速度跟不上（在y指令为0时代表惩罚侧倾的现象）
-        # lin_vel_error = torch.abs(self.commands[:, 1] - self.base_lin_vel[:, 1])
+      
         return torch.exp(-lin_vel_error / self.cfg.rewards.tracking_sigma)
         # return -lin_vel_error
 
@@ -1205,65 +1543,16 @@ class TitaAirbotRobot:
         # Tracking of angular velocity commands (yaw)
         ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
         return torch.exp(-ang_vel_error / self.cfg.rewards.tracking_sigma)
-
-    def _reward_feet_air_time(self):
-        # Reward steps between proper duration
-        rew_airTime_below_min = torch.sum(
-            torch.min(self.feet_air_time - self.cfg.rewards.min_feet_air_time,
-                      torch.zeros_like(self.feet_air_time)) * self.first_contact,
-            dim=1)
-        rew_airTime_above_max = torch.sum(
-            torch.min(self.cfg.rewards.max_feet_air_time - self.feet_air_time,
-                      torch.zeros_like(self.feet_air_time)) * self.first_contact,
-            dim=1)
-        rew_airTime = rew_airTime_below_min + rew_airTime_above_max
-        return rew_airTime
-
+    
     def _reward_no_fly(self):
         contacts = self.contact_forces[:, self.feet_indices, 2] > 0.1
         single_contact = torch.sum(1. * contacts, dim=1) == 1
         return 1. * single_contact
-
-    def _reward_unbalance_feet_air_time(self):
-        return torch.var(self.last_feet_air_time, dim=-1)
-
-    def _reward_unbalance_feet_height(self):
-        return torch.var(self.last_max_feet_height, dim=-1)
-
-    def _reward_stumble(self):
-        # Penalize feet hitting vertical surfaces
-        return torch.any(torch.norm(self.contact_forces[:, self.feet_indices, :2], dim=2) > \
-                         5 * torch.abs(self.contact_forces[:, self.feet_indices, 2]), dim=1)
-
-    # def _reward_stand_still(self):
-    #     # Penalize displacement and rotation at zero commands
-    #     reward_lin = torch.abs(self.base_lin_vel[:, :2]) * (self.commands[:, :2] < 0.1)
-    #     reward_ang = (torch.abs(self.base_ang_vel[:, -1]) * (self.commands[:, 2] < 0.1)).unsqueeze(dim=-1)
-    #     return torch.sum(torch.cat((reward_lin, reward_ang), dim=-1), dim=-1)
-    
+ 
     def _reward_stand_still(self):
         # Penalize motion at zero commands
-        #exclude wheel
-        dof_select=[0,1,2,4,5,6]
-        dof_err = self.dof_pos - self.default_dof_pos
-        return torch.sum(torch.abs(dof_err[:,dof_select]), dim=1) * (torch.abs(self.commands[:, 0]) < 0.05)
-
-
-    def _reward_feet_contact_forces(self):
-        # penalize high contact forces
-        return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :],
-                                     dim=-1) - self.cfg.rewards.max_contact_force).clip(min=0.), dim=1)
-
-    # def _reward_feet_distance(self):
-    #     reward = 0
-    #     for i in range(self.feet_state.shape[1] - 1):
-    #         for j in range(i + 1, self.feet_state.shape[1]):
-    #             feet_distance = torch.norm(
-    #                 self.feet_state[:, i, :2] - self.feet_state[:, j, :2], dim=-1
-    #             )
-    #         reward += torch.clip(self.cfg.rewards.min_feet_distance - feet_distance, 0, 1)
-    #     return reward
-    
+        return torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1) * (torch.abs(self.commands[:, 0]) < 0.05)
+  
     def _reward_feet_distance(self):
         feet_distance = torch.abs(torch.norm(self.feet_state[:, 0, :2] - self.feet_state[:, 1, :2], dim=-1))
         # reward = torch.abs(feet_distance - self.cfg.rewards.min_feet_distance)
@@ -1274,20 +1563,7 @@ class TitaAirbotRobot:
     def _reward_survival(self):
         # return (~self.reset_buf).float() * self.dt
         return (self.episode_length_buf * self.dt) > 10
-    
-    def _reward_nominal_foot_position(self):
-        #1. calculate foot postion wrt base in base frame  
-        nominal_base_height = -(self.cfg.rewards.base_height_target- self.cfg.asset.foot_radius)
-        foot_positions_base = self.foot_positions - \
-                            (self.base_position).unsqueeze(1).repeat(1, len(self.feet_indices), 1)
-        reward = 0
-        for i in range(len(self.feet_indices)):
-            foot_positions_base[:, i, :] = quat_rotate_inverse(self.base_quat, foot_positions_base[:, i, :] )
-            height_error = nominal_base_height - foot_positions_base[:, i, 2]
-            reward += torch.exp(-(height_error ** 2)/ self.cfg.rewards.nominal_foot_position_tracking_sigma)
-        vel_cmd_norm = torch.norm(self.commands[:, :3], dim=1)
-        return reward / len(self.feet_indices)*torch.exp(-(vel_cmd_norm ** 2)/self.cfg.rewards.nominal_foot_position_tracking_sigma_wrt_v)
-    
+       
     def _reward_leg_symmetry(self):
         foot_positions_base = self.foot_positions - \
                             (self.base_position).unsqueeze(1).repeat(1, len(self.feet_indices), 1)
@@ -1295,29 +1571,6 @@ class TitaAirbotRobot:
             foot_positions_base[:, i, :] = quat_rotate_inverse(self.base_quat, foot_positions_base[:, i, :] )
         leg_symmetry_err = (abs(foot_positions_base[:,0,1])-abs(foot_positions_base[:,1,1]))
         return torch.exp(-(leg_symmetry_err ** 2)/ self.cfg.rewards.leg_symmetry_tracking_sigma)
-    
-    def _reward_same_foot_z_position(self):
-        reward = 0
-        foot_positions_base = self.foot_positions - \
-                            (self.base_position).unsqueeze(1).repeat(1, len(self.feet_indices), 1)
-        for i in range(len(self.feet_indices)):
-            foot_positions_base[:, i, :] = quat_rotate_inverse(self.base_quat, foot_positions_base[:, i, :] )
-        foot_z_position_err = foot_positions_base[:,0,2] - foot_positions_base[:,1,2]
-        return foot_z_position_err ** 2
-
-    def _reward_same_foot_x_position(self):
-        reward = 0
-        foot_positions_base = self.foot_positions - \
-                            (self.base_position).unsqueeze(1).repeat(1, len(self.feet_indices), 1)
-        for i in range(len(self.feet_indices)):
-            foot_positions_base[:, i, :] = quat_rotate_inverse(self.base_quat, foot_positions_base[:, i, :] )
-        foot_x_position_err = foot_positions_base[:,0,0] - foot_positions_base[:,1,0]
-        reward = torch.exp(-(foot_x_position_err ** 2)/ self.cfg.rewards.foot_x_position_sigma)
-        return reward
-    
-    def _reward_feet_vel(self):
-        reward = torch.norm(self.foot_velocities[:, 0, :], dim=1) + torch.norm(self.foot_velocities[:, 1, :], dim=1)
-        return reward
     
     def _reward_wheel_adjustment(self):
         # 鼓励使用轮子的滑动克服前后的倾斜，奖励轮速和倾斜方向一致的情况，并要求轮速方向也一致
@@ -1331,7 +1584,126 @@ class TitaAirbotRobot:
         reward = incline_x * wheel_x_mean > 0
         return reward
     
-    def _reward_inclination(self):
-        # 惩罚pitch和roll方向的角速度，防止侧倾
-        rp_error = torch.norm(self.base_ang_vel[:, :2], dim=1) # commands前两个维度是速度，和角速度无关
-        return rp_error
+    def _reward_torque_limits(self):
+        # penalize torques too close to the limit
+        return torch.sum(
+            (torch.abs(self.torques) - self.torque_limits * self.cfg.rewards.soft_torque_limit).clip(min=0.), dim=1)
+    
+    # 惩罚机器人两只脚在 X 方向上不对齐
+    def _reward_same_foot_x_position(self):
+        foot_positions_base = self.foot_positions - \
+            (self.base_position).unsqueeze(1).repeat(1, len(self.feet_indices), 1)
+        for i in range(len(self.feet_indices)):
+            foot_positions_base[:, i, :] = quat_rotate_inverse(self.base_quat, foot_positions_base[:, i, :] )
+        foot_x_position_err = foot_positions_base[:,0,0] - foot_positions_base[:,1,0] 
+        penalty = torch.abs(foot_x_position_err)
+        return penalty
+    
+    def _reward_leg_oscillation(self):
+        # shape: (num_envs,)
+        should_update = (self.episode_length_buf % self.cfg.rewards.dof_vel_history_length == 0)
+        is_oscillating = self.check_oscillation(self.dof_vel_history)  # shape: (num_envs, 2)
+
+        env_oscillate_left_leg = is_oscillating[:,0].float()
+        env_oscillate_right_leg = is_oscillating[:,1].float()
+
+        # if should_update:
+        #     if env_oscillate_left_leg.any():
+        #         print("Left leg oscillation")
+        #     if env_oscillate_right_leg.any():
+        #         print("Right leg oscillation")
+
+        self.last_leg_oscillation_reward[should_update,0] = env_oscillate_left_leg[should_update]
+        self.last_leg_oscillation_reward[should_update,1] = env_oscillate_right_leg[should_update]
+
+        total_oscillation_reward = torch.sum(self.last_leg_oscillation_reward, dim=1)
+
+        return total_oscillation_reward
+
+    def check_oscillation(self, vel_history):
+        hist = torch.stack(list(vel_history), dim=0)  # shape: (T, num_envs, 2)
+        sign_changes = (torch.sign(hist[1:]) - torch.sign(hist[:-1])) != 0
+        osc_score = sign_changes.sum(dim=0)           # shape: (num_envs, 2)
+        
+        zero_count = (hist == 0).sum(dim=0)  # (num_envs, 2)
+        zero_thresh = self.cfg.rewards.dof_vel_history_length / 2.
+        no_osc_mask = zero_count > zero_thresh
+       
+        osc_result = (osc_score > self.cfg.rewards.oscillation_sign_thresh) & (~no_osc_mask)
+        return osc_result
+
+    # ------------ airbot reward functions----------------
+
+    def _reward_dof_acc_arm (self):
+        # Penalize dof accelerations
+        vel_diff = self.last_dof_vel - self.dof_vel
+        vel_diff[:,:8] = 0
+        return torch.sum(torch.square(vel_diff / self.dt), dim=1)
+
+    def _reward_tracking_ee_cart(self):
+        ee_pos_error = torch.sum(torch.square(self.ee_pos_local - self.curr_ee_goal_local) * self.sphere_error_scale, dim=1)
+
+        horizontal_threshold = self.cfg.rewards.active_cartAndOrn_reward_threshold_horizontal  
+        horizontal_mask = (torch.norm(self.projected_gravity[:, :2], dim=1) < horizontal_threshold).float()
+
+        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+        spin_threshold = self.cfg.rewards.active_cartAndOrn_reward_threshold_spin  
+        spin_mask = (ang_vel_error < spin_threshold).float()
+
+        return torch.exp(-ee_pos_error/ self.cfg.rewards.tracking_ee_cart_sigma) * horizontal_mask * spin_mask
+
+    def _reward_tracking_ee_cart_l2(self):
+        ee_pos_error = torch.sum(torch.square(self.ee_pos_local - self.curr_ee_goal_local) * self.sphere_error_scale, dim=1)
+        return ee_pos_error
+    
+    def _reward_tracking_ee_orn(self):
+        # Compute distance to target
+        pos_err = torch.norm(self.ee_pos_local - self.curr_ee_goal_local, dim=1)
+        pos_threshold = self.cfg.rewards.active_orn_reward_threshold  # meters, tune as needed
+        close_mask = (pos_err < pos_threshold).float()
+
+        horizontal_threshold = self.cfg.rewards.active_cartAndOrn_reward_threshold_horizontal
+        horizontal_mask = (torch.norm(self.projected_gravity[:, :2], dim=1) < horizontal_threshold).float()
+
+        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+        spin_threshold = self.cfg.rewards.active_cartAndOrn_reward_threshold_spin  
+        spin_mask = (ang_vel_error < spin_threshold).float()
+
+        ee_orn_euler = euler_from_quat(self.ee_orn)
+        ee_goal_orn_euler = euler_from_quat(self.ee_goal_orn_quat)
+        orn_err = torch.sum(torch.abs((ee_goal_orn_euler - ee_orn_euler)) * self.orn_error_scale, dim=1)
+        return torch.exp(-orn_err/self.cfg.rewards.tracking_ee_orn_sigma) * horizontal_mask * spin_mask#* close_mask 
+
+    def _reward_tracking_ee_orn_l2(self):
+        # Compute distance to target
+        pos_err = torch.norm(self.ee_pos_local - self.curr_ee_goal_local, dim=1)
+        pos_threshold = self.cfg.rewards.active_orn_reward_threshold  # meters, tune as needed
+        close_mask = (pos_err < pos_threshold).float()
+
+        ee_orn_euler = euler_from_quat(self.ee_orn)
+        ee_goal_orn_euler = euler_from_quat(self.ee_goal_orn_quat)
+        orn_err = torch.sum(torch.abs((ee_goal_orn_euler - ee_orn_euler)) * self.orn_error_scale, dim=1)
+        return orn_err #* close_mask
+    
+    def _reward_com_pos(self):
+        rigid_body_pos_tita = self.rigid_body_states[:,:9,:3]
+        rigid_body_pos_arm = self.rigid_body_states[:,9:,:3]
+        # -----------------------------
+        # 底盘部分 COM
+        total_mass_tita = torch.sum(self.rigid_body_mass_tita, dim=1)  # [num_envs, 1]
+        weighted_chassis = torch.sum(rigid_body_pos_tita * self.rigid_body_mass_tita, dim=1)  # [num_envs, 3]
+        self.com_tita = weighted_chassis / total_mass_tita              # [num_envs, 3]
+        # -----------------------------
+        # 机械臂部分 COM
+        total_mass_arm = torch.sum(self.rigid_body_mass_arm, dim=1)  # [num_envs, 1]
+        weighted_arm = torch.sum(rigid_body_pos_arm * self.rigid_body_mass_arm, dim=1)  # [num_envs, 3]
+        self.com_arm = weighted_arm / total_mass_arm              # [num_envs, 3]
+        
+        com_err = torch.sum(torch.square((self.com_tita[:,:2] - self.com_arm[:,:2])), dim=1)
+        return torch.exp(-com_err / self.cfg.rewards.com_pos_sigma)
+    
+    def _reward_arm_dof_pos_limits(self):
+        # Penalize dof positions too close to the limit
+        out_of_limits = torch.square((self.dof_pos[:,8:] - self.dof_pos_limits[8:, 0]).clip(max=0.))  # lower limit
+        out_of_limits += torch.square((self.dof_pos[:,8:] - self.dof_pos_limits[8:, 1]).clip(min=0.))
+        return torch.sum(out_of_limits, dim=1)

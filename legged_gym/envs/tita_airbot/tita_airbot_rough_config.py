@@ -2,7 +2,7 @@ from legged_gym.envs.base.base_config import BaseConfig
 
 class TitaAirbotRoughCfg(BaseConfig):
     class env:
-        num_envs = 8192
+        num_envs = 2048 #8192
         num_propriceptive_obs = 27 + 2 + 2
         num_privileged_obs = 152  # if not None a priviledge_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise
         num_actions = 8
@@ -45,7 +45,7 @@ class TitaAirbotRoughCfg(BaseConfig):
         heading_command = False  # if true: compute ang vel command from heading error
 
         class ranges:
-            lin_vel_x = [-1.0, 1.0]  # min max [m/s]
+            lin_vel_x = [-0.6, 0.6]  # min max [m/s]
             lin_vel_y = [-0.0, 0.0]  # min max [m/s]
             ang_vel_yaw = [-1, 1]  # min max [rad/s]
             heading = [-3.14, 3.14]
@@ -110,11 +110,12 @@ class TitaAirbotRoughCfg(BaseConfig):
         foot_name = '_leg_4'
         terminate_after_contacts_on = ["base_link", "_leg_3"]
         penalize_contacts_on = ["base_link", "_leg_3"]
+        end_effector_name = 'joint_end_effector'
         disable_gravity = False
         collapse_fixed_joints = True  # merge bodies connected by fixed joints. Specific fixed joints can be kept by adding " <... dont_collapse="true">
         fix_base_link = False  # fixe the base of the robot
         default_dof_drive_mode = 3  # see GymDofDriveModeFlags (0 is none, 1 is pos tgt, 2 is vel tgt, 3 effort)
-        self_collisions = 0  # 1 to disable, 0 to enable...bitwise filter
+        self_collisions = 1  # 1 to disable, 0 to enable...bitwise filter
         replace_cylinder_with_capsule = True  # replace collision cylinders with capsules, leads to faster/more stable simulation
         flip_visual_attachments = False  # Some .obj meshes must be flipped from y-up to z-up
 
@@ -181,6 +182,8 @@ class TitaAirbotRoughCfg(BaseConfig):
         nominal_foot_position_tracking_sigma_wrt_v = 0.5
         leg_symmetry_tracking_sigma = 0.001
         foot_x_position_sigma = 0.001
+
+
     class normalization:
         class obs_scales:
             lin_vel = 2.0
@@ -231,7 +234,7 @@ class TitaAirbotRoughCfg(BaseConfig):
 
 
 class TitaAirbotRoughCfgPPO(BaseConfig):
-    seed = 1
+    seed = 6657
     runner_class_name = 'OnPolicyRunner'
 
     class policy:
@@ -252,7 +255,7 @@ class TitaAirbotRoughCfgPPO(BaseConfig):
         entropy_coef = 0.01
         num_learning_epochs = 5
         num_mini_batches = 4  # mini batch size = num_envs*nsteps / nminibatches
-        learning_rate = 1.e-3  # 5.e-4
+        learning_rate = 5.e-4 #1.e-3  # 5.e-4
         schedule = 'adaptive'  # could be adaptive, fixed
         gamma = 0.99
         lam = 0.95

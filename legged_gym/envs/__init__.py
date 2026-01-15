@@ -28,25 +28,13 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
-from legged_gym.envs.a1.a1_config import A1RoughCfg, A1RoughCfgPPO
 from .base.legged_robot import LeggedRobot
-from .anymal_c.anymal import Anymal
-from .anymal_c.mixed_terrains.anymal_c_rough_config import AnymalCRoughCfg, AnymalCRoughCfgPPO
-from .anymal_c.flat.anymal_c_flat_config import AnymalCFlatCfg, AnymalCFlatCfgPPO
-from .anymal_b.anymal_b_config import AnymalBRoughCfg, AnymalBRoughCfgPPO
-from .cassie.cassie import Cassie
-from .cassie.cassie_config import CassieRoughCfg, CassieRoughCfgPPO
-from .a1.a1_config import A1RoughCfg, A1RoughCfgPPO
 from .tita.tita import Tita
 from .tita.tita_rough_config import TitaRoughCfg, TitaRoughCfgPPO
 from .tita.tita_flat_config import TitaFlatCfg, TitaFlatCfgPPO
+from .airbot.tita_airbot.tita_airbot_rough_only_config import TitaAirbotRoughOnlyCfg, TitaAirbotRoughOnlyCfgPPO
 
 from legged_gym.utils.task_registry import task_registry
-task_registry.register("anymal_c_rough", Anymal, AnymalCRoughCfg(), AnymalCRoughCfgPPO())
-task_registry.register("anymal_c_flat", Anymal, AnymalCFlatCfg(), AnymalCFlatCfgPPO())
-task_registry.register("anymal_b", Anymal, AnymalBRoughCfg(), AnymalBRoughCfgPPO())
-task_registry.register("a1", LeggedRobot, A1RoughCfg(), A1RoughCfgPPO())
-task_registry.register("cassie", Cassie, CassieRoughCfg(), CassieRoughCfgPPO())
 task_registry.register("tita_flat", Tita, TitaFlatCfg(), TitaFlatCfgPPO())
 task_registry.register("tita_rough", Tita, TitaRoughCfg(), TitaRoughCfgPPO())
 
@@ -56,6 +44,32 @@ from .tita_airbot.tita_airbot_flat_config import TitaAirbotFlatCfg, TitaAirbotFl
 
 task_registry.register("tita_airbot_flat", TitaAirbotRobot, TitaAirbotFlatCfg(), TitaAirbotFlatCfgPPO())
 task_registry.register("tita_airbot_rough", TitaAirbotRobot, TitaAirbotRoughCfg(), TitaAirbotRoughCfgPPO())
+
+from .tita_airbot_copy.tita_airbot_follow_robot import TitaAirbotRobot_F
+from .tita_airbot_copy.tita_airbot_follow_config import TitaAirbotFollowCfg, TitaAirbotFollowCfgPPO
+
+task_registry.register("tita_airbot_follow", TitaAirbotRobot_F, TitaAirbotFollowCfg(), TitaAirbotFollowCfgPPO())
+
+from .tita_airbot_copy.tita_airbot_follow_constrain_robot import TitaAirbotRobotConstrain_F
+from .tita_airbot_copy.tita_airbot_follow_constrain_config import TitaAirbotFollowConstrainCfg, TitaAirbotFollowConstrainCfgPPO
+task_registry.register("tita_airbot_constrain", TitaAirbotRobotConstrain_F, TitaAirbotFollowConstrainCfg(), TitaAirbotFollowConstrainCfgPPO())
+
+from .tita_airbot_copy.TAF_visual_wholebody_robot import TAFVisualWholebodyRobot
+from .tita_airbot_copy.TAF_visual_wholebody_config import TAFVisualWholebodyCfg, TAFVisualWholebodyCfgPPO
+task_registry.register("tita_visual_wholebody", TAFVisualWholebodyRobot, TAFVisualWholebodyCfg(), TAFVisualWholebodyCfgPPO())
+
+from .airbot.tita_airbot.tita_airbot_only_robot import TitaAirbotOnlyRobot
+from .airbot.tita_airbot.tita_airbot_only_config import TitaAirbotOnlyCfg, TitaAirbotOnlyCfgPPO
+task_registry.register("tita_airbot_only",TitaAirbotOnlyRobot,TitaAirbotOnlyCfg(),TitaAirbotOnlyCfgPPO())
+
+from .tita_airbot_np3o.tita_airbot_np3o_config import TitaAirbotNP3OCfg, TitaAirbotNP3OCfgPPO
+from .tita_airbot_np3o.tita_airbot_robot_np3o import TitaAirbotRobotNP3O
+task_registry.register("tita_airbot_np3o", TitaAirbotRobotNP3O, TitaAirbotNP3OCfg(), TitaAirbotNP3OCfgPPO())
+
+from .franka.franka_only_config import FrankaOnlyCfg, FrankaOnlyCfgPPO
+from .franka.franka_only_robot import FrankaOnlyRobot
+task_registry.register("franka_only", FrankaOnlyRobot, FrankaOnlyCfg(), FrankaOnlyCfgPPO())
+
 # import os
 # import sys
 # robot_type = os.getenv("ROBOT_TYPE")

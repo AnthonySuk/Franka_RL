@@ -54,3 +54,40 @@ def torch_rand_sqrt_float(lower, upper, shape, device):
     r = torch.where(r<0., -torch.sqrt(-r), torch.sqrt(r))
     r =  (r + 1.) / 2.
     return (upper - lower) * r + lower
+
+def euler_from_quat(quat: torch.Tensor) -> torch.Tensor:
+    """
+    Converts quaternion(s) to Euler angles (XYZ / roll-pitch-yaw).
+    quat: [N, 4] tensor of quaternions in (x, y, z, w) format.
+    Returns: [N, 3] tensor of Euler angles in radians.
+    """
+    x, y, z, w = quat.unbind(-1)
+
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + y * y)
+    roll_x = torch.atan2(t0, t1)
+
+    t2 = +2.0 * (w * y - z * x)
+    t2 = torch.clamp(t2, min=-1.0, max=1.0)
+    pitch_y = torch.asin(t2)
+
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (y * y + z * z)
+    yaw_z = torch.atan2(t3, t4)
+
+    return torch.stack([roll_x, pitch_y, yaw_z], dim=-1)  # shape [N, 3]
+
+
+def torch_wrap_to_pi_minuspi(angle):
+  """Wraps an angle (in radians) to the range [-pi, pi].
+
+  Args:
+    angle: A PyTorch tensor representing the angle.
+
+  Returns:
+    A PyTorch tensor with the angle wrapped to the range [-pi, pi].
+  """
+  angle = torch.fmod(angle, 2 * torch.pi)  # Bring angle to (-2pi, 2pi)
+  angle = torch.fmod(angle + torch.pi, 2 * torch.pi)  # Shift to (-pi, 3pi) and wrap again
+  angle[angle == -torch.pi] = torch.pi  # Handle the case where angle is -pi
+  return angle

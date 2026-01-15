@@ -20,7 +20,7 @@ def export_policy_as_onnx(args):
         env_cfg.env.num_privileged_obs = env_cfg.env.num_propriceptive_obs
     actor_critic = actor_critic_class(
         env_cfg.env.num_propriceptive_obs, env_cfg.env.num_privileged_obs, env_cfg.env.num_actions, **class_to_dict(train_cfg.policy)
-    ).to(args.rl_device)
+        ).to(args.rl_device)
     actor_critic.load_state_dict(loaded_dict['model_state_dict'])
     # export policy as an onnx file
     path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 'exported', 'policies')
